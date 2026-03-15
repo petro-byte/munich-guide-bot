@@ -111,6 +111,7 @@ While the public bot is no longer active, the project remains a useful snapshot 
 
 **Luka Petrovic**  
 Technical University of Munich
+
 Contact: luka.petrovic@tum.de
 
 <div align="center">
