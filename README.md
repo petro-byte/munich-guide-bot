@@ -6,8 +6,6 @@ This project was originally developed as a small practical bot project for excha
 
 The repository is preserved here as a **portfolio artifact**. It showcases an early Node.js / Telegram bot project and documents the original idea and implementation.
 
----
-
 ## Project Status
 
 This bot is **currently offline** and is **not maintained as an active production service**.
@@ -21,8 +19,6 @@ The original deployment depended on external infrastructure and credentials that
 
 As a result, this repository should be understood primarily as a **code showcase / archived artifact**, not as a ready-to-run public bot.
 
----
-
 ## What the Bot Did
 
 The bot led users through **20 stations** in Munich's inner city.
@@ -34,8 +30,6 @@ At each station, the player received:
 
 To advance, the player had to submit the correct answer. The bot also tracked progress, supported resuming interrupted games, and displayed a simple leaderboard.
 
----
-
 ## Features
 
 - Telegram-based interactive city tour
@@ -46,8 +40,6 @@ To advance, the player had to submit the correct answer. The bot also tracked pr
 - penalty mechanism for repeated incorrect answers
 - background information for each station
 
----
-
 ## Tech Stack
 
 - **Node.js**
@@ -55,16 +47,12 @@ To advance, the player had to submit the correct answer. The bot also tracked pr
 - **Google Sheets** as a lightweight persistence layer
 - **dotenv** for environment-based configuration
 
----
-
 ## Repository Contents
 
 - `bot.js` — main Telegram bot implementation
 - `envelopes.json` — clues, tasks, and station information
 - `the_guide.png` — project image / visual asset
 - `package.json` — project metadata and dependencies
-
----
 
 ## Commands
 
@@ -79,8 +67,6 @@ To advance, the player had to submit the correct answer. The bot also tracked pr
 | `/showprogress` | Show current progress |
 | `/info` | Show information about the current station |
 
----
-
 ## Notes on Reproducibility
 
 This codebase reflects the original implementation and has intentionally been preserved in a mostly historical form.
@@ -92,8 +78,6 @@ It is therefore **not guaranteed to run out of the box** without recreating the 
 - compatible Google Sheets credentials
 - the expected spreadsheet structure used by the bot backend
 
----
-
 ## Why This Repository Exists
 
 This repository is included in my portfolio as an example of an applied side project involving:
@@ -104,8 +88,6 @@ This repository is included in my portfolio as an example of an applied side pro
 - real-world deployment considerations
 
 While the public bot is no longer active, the project remains a useful snapshot of an early practical software project.
-
----
 
 ## Author
 
