@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: munich-guide-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DEPLOYMENT_MODE
+        value: webhook
+      - key: PUBLIC_URL
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GOOGLE_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_ACCOUNT_TYPE
+        value: service_account
+      - key: GOOGLE_PROJECT_ID
+        sync: false
+      - key: GOOGLE_PRIVATE_KEY_ID
+        sync: false
+      - key: GOOGLE_PRIVATE_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_EMAIL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_AUTH_URI
+        value: https://accounts.google.com/o/oauth2/auth
+      - key: GOOGLE_TOKEN_URI
+        value: https://oauth2.googleapis.com/token
+      - key: GOOGLE_AUTH_PROVIDER_CERT_URL
+        value: https://www.googleapis.com/oauth2/v1/certs
+      - key: GOOGLE_CLIENT_CERT_URL
+        sync: false
+      - key: PENALTY_SECONDS
+        value: "300"
+      - key: ENVELOPE_ORDER
+        value: "1,9,5,12,15,18,8,6,3,30,14,7,11,16,19,13,17,2,4,21"

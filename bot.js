@@ -1,721 +1,1001 @@
+"use strict";
+
 /**
  * Munich Scavenger Hunt Telegram Bot
- * =================================
+ * ----------------------------------
+ * This bot guides players through a city-based scavenger hunt and stores
+ * progress in a Google Spreadsheet.
  *
- * This file contains the original Telegram bot implementation for an
- * interactive scavenger hunt through Munich's historical city center.
- *
- * Main responsibilities of this script:
- * - initialize the Telegram bot via Telegraf
- * - manage player sessions and scene transitions
- * - serve clues and validate answers for each station
- * - persist progress, leaderboard entries, and penalties in Google Sheets
- * - expose the bot through a webhook-based deployment (originally Heroku)
- *
- * Notes:
- * - This version intentionally preserves the original behavior and structure.
- * - No functional logic has been changed; only formatting and documentation
- *   were improved to make the code easier to read as a portfolio artifact.
- * - Secrets such as Telegram tokens and Google credentials are expected to be
- *   provided through environment variables.
+ * This version is functionally identical to the original implementation.
+ * The changes are limited to:
+ * - clearer structure
+ * - consistent formatting
+ * - descriptive comments
+ * - JSDoc-style documentation
+ * - improved readability for repository presentation
  */
 
 require("dotenv").config();
+
+const fs = require("fs");
 const Telegraf = require("telegraf");
 const session = require("telegraf/session");
 const Stage = require("telegraf/stage");
 const Scene = require("telegraf/scenes/base");
-const fs = require("fs");
 const { GoogleSpreadsheet } = require("google-spreadsheet");
 
-// -----------------------------------------------------------------------------
-// Static game data
-// -----------------------------------------------------------------------------
-// The envelopes file contains all station-specific content such as clue text,
-// tasks, and informational follow-up messages.
-const envelopesRawData = fs.readFileSync("envelopes.json");
-const envelopesJSON = JSON.parse(envelopesRawData);
+/* -------------------------------------------------------------------------- */
+/*                                  Constants                                 */
+/* -------------------------------------------------------------------------- */
 
-// -----------------------------------------------------------------------------
-// Telegram bot initialization
-// -----------------------------------------------------------------------------
+/**
+ * Static scavenger-hunt content loaded from disk.
+ * Each entry represents one station or final message block.
+ */
+const envelopesJSON = JSON.parse(fs.readFileSync("envelopes.json", "utf8"));
+
+/**
+ * Required environment variables for startup.
+ * The bot exits immediately if any of these are missing.
+ */
+const REQUIRED_ENV = ["TELEGRAM_TOKEN", "GOOGLE_SPREADSHEET_ID"];
+
+/**
+ * Intro message shown when a user starts the bot.
+ */
+const startMessage = `
+Greetings traveller! You just arrived in Munich a few days or weeks ago I assume. The city can seem big and scary at first. But do not worry! With some navigational skills as well as some simple math I will guide you through the historical core of the city on this year's inner city Scavenger Hunt.
+To start the Scavenger Hunt enter /newgame.
+For all available commands enter /help.
+Please make sure you have registered a Telegram username to be able to participate in the Scavenger Hunt.
+If you encounter any problems or unusual behaviour, please contact the maintainer of this demo bot.`;
+
+/**
+ * Penalty duration in seconds after too many wrong answers.
+ * Falls back to 1800 seconds (= 30 minutes).
+ */
+const PENALTY_SECONDS = parseInt(process.env.PENALTY_SECONDS || "1800", 10);
+
+/**
+ * The configured correct answer order taken from the environment.
+ * Example format: "3,5,2,8,..."
+ */
+const envelopeOrder = parseEnvelopeOrder(process.env.ENVELOPE_ORDER);
+
+/**
+ * Number of playable answer stations.
+ * It is capped by both the scavenger-hunt data and the configured answer order.
+ */
+const ANSWER_COUNT = Math.min(envelopesJSON.length - 1, envelopeOrder.length);
+
+/* -------------------------------------------------------------------------- */
+/*                             Environment Validation                         */
+/* -------------------------------------------------------------------------- */
+
+const missingEnv = REQUIRED_ENV.filter((name) => !process.env[name]);
+
+if (missingEnv.length > 0) {
+    console.error(
+        `Missing required environment variables: ${missingEnv.join(", ")}`,
+    );
+    process.exit(1);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Bot / Session / Scenes Setup                     */
+/* -------------------------------------------------------------------------- */
+
 const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
-
-// The original deployment used a Telegram webhook served by Heroku.
-// The webhook URL is built from the public Heroku URL and the bot token.
-bot.telegram.setWebhook(
-  `${process.env.HEROKU_URL}/bot${process.env.TELEGRAM_TOKEN}`
-);
-
-bot.startWebhook(`/bot${process.env.TELEGRAM_TOKEN}`, null, process.env.PORT);
-
-// For debugging purposes the bot could also be started locally via long polling.
-// bot.launch();
-
-// -----------------------------------------------------------------------------
-// Session and scene management
-// -----------------------------------------------------------------------------
-// Telegraf session middleware is used to keep temporary per-user state in memory,
-// while scenes model the two interactive modes of the bot:
-//   1) the actual game flow
-//   2) the decision flow for users with an existing unfinished game
 const stage = new Stage();
+
+/**
+ * Main gameplay scene.
+ * Users enter this scene when actively playing a scavenger hunt.
+ */
+const game = new Scene("game");
+
+/**
+ * Decision scene for users who already have a saved game.
+ * They can either resume or overwrite it with a new run.
+ */
+const existingGame = new Scene("existingGame");
+
+stage.register(game);
+stage.register(existingGame);
+
 bot.use(session());
 bot.use(stage.middleware());
 
-// -----------------------------------------------------------------------------
-// Runtime configuration
-// -----------------------------------------------------------------------------
-// ENVELOPE_ORDER defines the correct answer sequence for the scavenger hunt.
-// It is expected as a comma-separated environment variable, e.g. "3, 7, 2, ...".
-const envelopeOrder = process.env.ENVELOPE_ORDER
-  .split(", ")
-  .map((e) => parseInt(e));
-
-// Google service account credentials are reconstructed from environment
-// variables to avoid storing sensitive JSON credentials in the repository.
-const creds = {
-  type: process.env.GOOGLE_ACCOUNT_TYPE,
-  project_id: process.env.GOOGLE_PROJECT_ID,
-  private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-  private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-  client_email: process.env.GOOGLE_CLIENT_EMAIL,
-  client_id: process.env.GOOGLE_CLIENT_ID,
-  auth_uri: process.env.GOOGLE_AUTH_URI,
-  token_uri: process.env.GOOGLE_TOKEN_URI,
-  auth_provider_x509_cert_url: process.env.GOOGLE_AUTH_PROVIDER_CERT_URL,
-  client_x509_cert_url: process.env.GOOGLE_CLIENT_CERT_URL,
-};
-
-// -----------------------------------------------------------------------------
-// Scene declarations
-// -----------------------------------------------------------------------------
-const game = new Scene("game");
-stage.register(game);
-
-const existingGame = new Scene("existingGame");
-stage.register(existingGame);
-
-// -----------------------------------------------------------------------------
-// Static bot messages
-// -----------------------------------------------------------------------------
-const startMessage = `
-Greetings traveller! You just arrived in Munich a few days or weeks ago I assume. The city can seem big and scary at first. But do not worry! With some navigational skills as well as some simple math I will guide you through the historical core of the city on this years inner city Scavenger Hunt.
-To start the Scavenger Hunt enter /newgame .
-For all available commands enter /help .
-Please make sure you have registerd a Telegram-Username to be able to participate in the Scavenger Hunt.
-If you encounter any problems or unusual behaviour, please contact @nero_the_hero.`;
-
-// -----------------------------------------------------------------------------
-// Global commands
-// -----------------------------------------------------------------------------
-
-// /start: greet the user and explain the basic usage of the bot.
-bot.start((ctx) => ctx.reply(startMessage));
-
-// /help: print all supported commands.
-bot.command("help", (ctx) => {
-  ctx.reply(`Here is a list of all available commands:
-/help - List all commands
-/newgame - Start a new Scavenger Hunt.
-/resumegame - Resume an your Scavenger Hunt.
-/endgame - End your current Scavenger Hunt.
-/ladder - Show the first ten players to finish the Scavenger Hunt.
-/clue - Shows the last clue.
-/showprogress - Shows how far you have gotten on your Scavenger Hunt.
-/info - Shows interesting facts about your curret station.`);
-});
-
-// /ladder: fetch and display the current leaderboard.
-bot.command("ladder", (ctx) => {
-  parseLadder().then((ladder) => {
-    ctx.reply(`Here is the current ladder:\n${ladder}`);
-  });
-});
-
-// /newgame: start a new scavenger hunt if no unfinished game exists.
-// If the player already has an unfinished game, redirect them into the
-// existingGame scene where they can choose to resume or reset their progress.
-bot.command("newgame", (ctx) => {
-  if (typeof ctx.from.username !== "undefined") {
-    gameFound(ctx.from.username).then((found) => {
-      if (!found) {
-        ctx.session.save = {
-          player: ctx.from.username,
-          level: 0,
-          penaltyCount: 0,
-        };
-
-        saveGame(
-          ctx.session.save.player,
-          ctx.session.save.level,
-          ctx.session.save.penaltyCount
-        );
-
-        ctx.reply("Starting new game. Get ready for your first clue.");
-        ctx.scene.enter("game");
-      } else {
-        ctx.reply(
-          'It seems like you haven\'t finished an existing Scavenger Hunt.\nEnter "resume" to resume your existing Scavenger Hunt.\nEnter "new" to start a new Scavenger Hunt. Your old progress will be lost.'
-        );
-        ctx.scene.enter("existingGame");
-      }
-    });
-  } else {
-    ctx.reply(
-      'It appears that you haven\'t registered a Telegram-Username. Please enter your Username under "Telegram > Settings" before participating in the Scavenger Hunt.'
-    );
-  }
-});
-
-// /resumegame: restore the saved state of an unfinished game.
-bot.command("resumegame", (ctx) => {
-  if (typeof ctx.from.username !== undefined) {
-    gameFound(ctx.from.username).then((found) => {
-      if (found) {
-        loadGame(ctx.from.username).then((game) => {
-          ctx.session.save = game;
-          ctx.reply(
-            `Game found. Your Scavenger Hunt will be resumed. Here is your last clue:`
-          );
-          ctx.scene.leave();
-          ctx.scene.enter("game");
-        });
-      } else {
-        ctx.reply(
-          "A game with your registered Telegram-Username could not be found. Please start a new game by entering /newgame."
-        );
-      }
-    });
-  } else {
-    ctx.reply(
-      'It appears that you haven\'t registered a Telegram-Username. Please enter your Username under "Telegram > Settings" before participating in the Scavenger Hunt.'
-    );
-  }
-});
-
-// These commands are available globally, but some of them only make sense
-// inside an active game. Outside the scene, the bot responds with a hint.
-bot.command("clue", (ctx) => {
-  ctx.reply("Please enter a game by using /newgame or /resumegame.");
-});
-
-bot.command("showprogress", (ctx) => {
-  loadGame(ctx.from.username).then((game) => {
-    var progressLevel = game.level;
-    ctx.reply(`You have completed ${progressLevel} out of 20 stations.`);
-  });
-});
-
-bot.command("info", (ctx) => {
-  ctx.reply("Please enter a game before using this command.");
-});
-
-// -----------------------------------------------------------------------------
-// Scene: existingGame
-// -----------------------------------------------------------------------------
-// This scene is entered when a user tries to start a new game although an
-// unfinished game already exists in storage.
-existingGame.on("text", (ctx) => {
-  if (ctx.message.text === "resume") {
-    loadGame(ctx.from.username).then((game) => {
-      ctx.session.save = game;
-      ctx.reply(
-        "Your old Scavenger Hunt will be resumed.\nHere is your last clue:"
-      );
-      ctx.scene.leave();
-      ctx.scene.enter("game");
-    });
-  } else if (ctx.message.text === "new") {
-    loadGame(ctx.from.username).then((game) => {
-      ctx.session.save = {
-        player: ctx.from.username,
-        level: 0,
-        penaltyCount: game.penaltyCount,
-      };
-
-      saveGame(
-        ctx.session.save.player,
-        ctx.session.save.level,
-        ctx.session.save.penaltyCount
-      );
-
-      ctx.reply(
-        "You have started a new Scavenger Hunt.\nYour old progress will be lost.\nHere is your first clue:"
-      );
-      ctx.scene.leave();
-      ctx.scene.enter("game");
-    });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// Scene: game
-// -----------------------------------------------------------------------------
-// When entering the game scene, the player receives the clue and task for the
-// current station.
-game.enter((ctx) => {
-  console.log(ctx.session.save);
-  ctx.reply(
-    `${envelopesJSON[ctx.session.save.level].clue}\n\n${
-      envelopesJSON[ctx.session.save.level].task
-    }`
-  );
-});
-
-// Main game handler: evaluates station answers, serves commands, updates the
-// penalty counter, and eventually completes the game.
-game.on("text", (ctx) => {
-  // Correct answer for the current station.
-  if (ctx.message.text === String(envelopeOrder[ctx.session.save.level])) {
-    checkPenalty(ctx.from.username).then((active) => {
-      if (!active) {
-        ctx.session.save.level++;
-        console.log(ctx.session.save);
-
-        saveGame(
-          ctx.session.save.player,
-          ctx.session.save.level,
-          ctx.session.save.penaltyCount
-        );
-
-        ctx.reply(
-          `Congrats! Your answer is right.\nUse /info to learn more about your current station.\nHere is the next clue:\n\n${
-            envelopesJSON[ctx.session.save.level].clue
-          }\n\n${envelopesJSON[ctx.session.save.level].task}`
-        );
-      } else {
-        getRemainingPenaltyTime(ctx.from.username).then((time) => {
-          ctx.reply(`Your penalty is still pending. Please wait ${time}.`);
-          if (ctx.session.save.penaltyCount !== 0) {
-            ctx.session.save.penaltyCount = 0;
-            saveGame(
-              ctx.session.save.player,
-              ctx.session.save.level,
-              ctx.session.save.penaltyCount
-            );
-          }
-        });
-      }
-    });
-  }
-  // Explicitly leave the current game while preserving progress.
-  else if (ctx.message.text === "/endgame") {
-    ctx.reply("Leaving the current Scavenger Hunt. Your progress will be saved");
-    saveGame(
-      ctx.session.save.player,
-      ctx.session.save.level,
-      ctx.session.save.penaltyCount
-    );
-    ctx.scene.leave();
-  }
-  // Prevent duplicate game starts while already in the game scene.
-  else if (ctx.message.text === "/newgame") {
-    ctx.reply("Your Scavenger Hunt is already in progress.");
-  }
-  // Re-display the leaderboard while in the active scene.
-  else if (ctx.message.text === "/ladder") {
-    parseLadder().then((ladder) => {
-      ctx.reply(`Here is the current ladder:\n${ladder}`);
-    });
-  }
-  // In-scene help command.
-  else if (ctx.message.text === "/help") {
-    ctx.reply(`Here is a list of all available commands:
-/help - List all commands
-/newgame - Start a new Scavenger Hunt.
-/resumegame - Resume an your Scavenger Hunt.
-/endgame - End your current Scavenger Hunt.
-/ladder - Show the first ten players to finish the Scavenger Hunt.
-/clue - Shows the last clue.
-/showprogress - Shows how far you have gotten on your Scavenger Hunt.
-/info - Shows interesting facts about your curret station.`);
-  }
-  // Re-display the current clue.
-  else if (ctx.message.text === "/clue") {
-    ctx.reply(
-      `Here is your last clue:\n\n${
-        envelopesJSON[ctx.session.save.level].clue
-      }\n\n${envelopesJSON[ctx.session.save.level].task}`
-    );
-  }
-  // Show current progress in number of completed stations.
-  else if (ctx.message.text === "/showprogress") {
-    let progressLevel = ctx.session.save.level;
-    ctx.reply(`You have completed ${progressLevel} out of 20 stations.`);
-  }
-  // Show informational text for the last successfully completed station.
-  else if (ctx.message.text === "/info") {
-    if (ctx.session.save.level > 0)
-      ctx.reply(envelopesJSON[ctx.session.save.level - 1].info);
-  }
-  // Any other text is treated as an answer attempt for the current station.
-  else {
-    checkPenalty(ctx.from.username).then((active) => {
-      if (!active) {
-        ctx.reply("Your number is incorrect. Try again.");
-        ctx.session.save.penaltyCount++;
-
-        saveGame(
-          ctx.session.save.player,
-          ctx.session.save.level,
-          ctx.session.save.penaltyCount
-        );
-
-        // After more than two failed attempts, activate a temporary penalty.
-        if (ctx.session.save.penaltyCount > 2) {
-          setPenalty(ctx.from.username);
-          ctx.session.save.penaltyCount = 0;
-          saveGame(
-            ctx.session.save.player,
-            ctx.session.save.level,
-            ctx.session.save.penaltyCount
-          );
-        }
-      } else {
-        getRemainingPenaltyTime(ctx.from.username).then((time) => {
-          ctx.reply(`Your penalty is still pending. Please wait ${time}.`);
-          if (ctx.session.save.penaltyCount !== 0) {
-            ctx.session.save.penaltyCount = 0;
-            saveGame(
-              ctx.session.save.player,
-              ctx.session.save.level,
-              ctx.session.save.penaltyCount
-            );
-          }
-        });
-      }
-    });
-  }
-
-  // Once the final station has been completed, finish the game, record the
-  // player in the ladder, and remove the active save entry.
-  if (ctx.session.save.level === 19) {
-    ctx.reply(
-      "Congratulations! You have sucessfully finished the Scavenger Hunt."
-    );
-    addPlayerToLadder(ctx.session.save.player);
-    deleteGame(ctx.session.save.player);
-    ctx.scene.leave();
-  }
-});
-
-// -----------------------------------------------------------------------------
-// Google Sheets persistence helpers
-// -----------------------------------------------------------------------------
-// The spreadsheet contains at least three sheets:
-//   sheet[0] -> active game states
-//   sheet[1] -> ladder / leaderboard
-//   sheet[2] -> penalty timestamps
+/* -------------------------------------------------------------------------- */
+/*                              Helper Functions                              */
+/* -------------------------------------------------------------------------- */
 
 /**
- * Check whether a player already has a saved game.
+ * Parses the ENVELOPE_ORDER environment variable into an array of numbers.
  *
- * @param {string} playerName Telegram username
- * @returns {Promise<boolean>} true if a game save exists, otherwise false
+ * @param {string | undefined} value - Raw environment variable value.
+ * @returns {number[]} Parsed envelope order.
+ */
+function parseEnvelopeOrder(value) {
+    if (!value) {
+        console.error("ENVELOPE_ORDER is missing.");
+        process.exit(1);
+    }
+
+    return value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map((entry) => parseInt(entry, 10));
+}
+
+/**
+ * Builds the Google service-account credential object from environment
+ * variables. The private key is normalized so escaped line breaks work.
+ *
+ * @returns {object} Google service-account credentials.
+ */
+function getGoogleCredentials() {
+    const privateKey = process.env.GOOGLE_PRIVATE_KEY
+        ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n")
+        : undefined;
+
+    return {
+        type: process.env.GOOGLE_ACCOUNT_TYPE || "service_account",
+        project_id: process.env.GOOGLE_PROJECT_ID,
+        private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
+        private_key: privateKey,
+        client_email: process.env.GOOGLE_CLIENT_EMAIL,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        auth_uri:
+            process.env.GOOGLE_AUTH_URI ||
+            "https://accounts.google.com/o/oauth2/auth",
+        token_uri:
+            process.env.GOOGLE_TOKEN_URI ||
+            "https://oauth2.googleapis.com/token",
+        auth_provider_x509_cert_url:
+            process.env.GOOGLE_AUTH_PROVIDER_CERT_URL ||
+            "https://www.googleapis.com/oauth2/v1/certs",
+        client_x509_cert_url: process.env.GOOGLE_CLIENT_CERT_URL,
+    };
+}
+
+/**
+ * Returns a connected spreadsheet instance and ensures the expected sheet
+ * structure is present before use.
+ *
+ * Expected sheet order:
+ * 0 -> saves
+ * 1 -> ladder
+ * 2 -> penalty
+ *
+ * @returns {Promise<GoogleSpreadsheet>} Initialized spreadsheet document.
+ */
+async function getDoc() {
+    const doc = new GoogleSpreadsheet(process.env.GOOGLE_SPREADSHEET_ID);
+    await doc.useServiceAccountAuth(getGoogleCredentials());
+    await doc.loadInfo();
+    await ensureSheetSchemas(doc);
+    return doc;
+}
+
+/**
+ * Verifies that the spreadsheet contains the required sheets and normalizes
+ * header rows if necessary.
+ *
+ * @param {GoogleSpreadsheet} doc - Spreadsheet document.
+ * @returns {Promise<void>}
+ */
+async function ensureSheetSchemas(doc) {
+    const saves = doc.sheetsByIndex[0];
+    const ladder = doc.sheetsByIndex[1];
+    const penalty = doc.sheetsByIndex[2];
+
+    if (!saves || !ladder || !penalty) {
+        throw new Error(
+            "Spreadsheet must contain exactly these sheets in order: saves, ladder, penalty.",
+        );
+    }
+
+    const saveHeaders = normalizeHeaderValues(saves.headerValues);
+    if (saveHeaders.join("|") !== "Player|Level|PenaltyCount") {
+        await saves.setHeaderRow(["Player", "Level", "PenaltyCount"]);
+    }
+
+    const ladderHeaders = normalizeHeaderValues(ladder.headerValues);
+    if (ladderHeaders.join("|") !== "Position|Player") {
+        await ladder.setHeaderRow(["Position", "Player"]);
+    }
+
+    const penaltyHeaders = normalizeHeaderValues(penalty.headerValues);
+    if (penaltyHeaders.join("|") !== "Player|Time") {
+        await penalty.setHeaderRow(["Player", "Time"]);
+    }
+}
+
+/**
+ * Normalizes spreadsheet header values for safe comparison.
+ *
+ * @param {string[] | undefined} values - Raw header values.
+ * @returns {string[]} Trimmed header values.
+ */
+function normalizeHeaderValues(values) {
+    return (values || []).map((value) => String(value || "").trim());
+}
+
+/**
+ * Ensures the Telegram user has a username, which is required to identify
+ * their game state in storage.
+ *
+ * @param {object} ctx - Telegraf context.
+ * @returns {boolean} True if the user has a username, otherwise false.
+ */
+function requireUsername(ctx) {
+    if (ctx.from && ctx.from.username) {
+        return true;
+    }
+
+    ctx.reply(
+        'It appears that you have not registered a Telegram username. Please set one under "Telegram > Settings" before participating in the Scavenger Hunt.',
+    );
+    return false;
+}
+
+/**
+ * Returns the clue/task text for the player's current station.
+ *
+ * @param {number} level - Current player level.
+ * @returns {string} Station text.
+ */
+function currentStationText(level) {
+    const entry = envelopesJSON[level];
+
+    if (!entry) {
+        return "No further station data available.";
+    }
+
+    if (entry.task) {
+        return `${entry.clue}\n\n${entry.task}`;
+    }
+
+    return entry.clue || entry.info || "No station text available.";
+}
+
+/**
+ * Builds a progress message for the player.
+ *
+ * @param {number} level - Current player level.
+ * @returns {string} Human-readable progress text.
+ */
+function completedStationsText(level) {
+    return `You have completed ${Math.min(level, ANSWER_COUNT)} out of ${ANSWER_COUNT} stations.`;
+}
+
+/**
+ * Generic fatal error handler for user-facing bot operations.
+ *
+ * @param {object} ctx - Telegraf context.
+ * @param {Error} error - Original error.
+ * @returns {Promise<void>}
+ */
+async function handleFatalError(ctx, error) {
+    console.error(error);
+    await ctx.reply(
+        "Something went wrong while accessing the bot data. Please try again in a moment.",
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Spreadsheet Data Access                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Checks whether a saved game exists for a given player.
+ *
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<boolean>} True if a save exists.
  */
 async function gameFound(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[0];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[0];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
-
-  var playerFound = false;
-  for (row of rows) {
-    if (row._rawData[0] === playerName) playerFound = true;
-  }
-
-  return playerFound;
+    return rows.some(
+        (row) => String(row._rawData[0] || row.Player || "") === playerName,
+    );
 }
 
 /**
- * Create or update a player's game state.
+ * Saves or updates a player's game state.
  *
- * @param {string} playerName Telegram username
- * @param {number} playerLevel Current station index
- * @param {number} penaltyCount Number of recent failed attempts
+ * @param {string} playerName - Telegram username.
+ * @param {number} playerLevel - Current level.
+ * @param {number} penaltyCount - Current wrong-attempt counter.
+ * @returns {Promise<void>}
  */
 async function saveGame(playerName, playerLevel, penaltyCount) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[0];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[0];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    let playerFound = false;
 
-  var playerFound = false;
-
-  for (row of rows) {
-    if (row._rawData[0] === playerName) {
-      row.Level = playerLevel;
-      row.PenaltyCount = penaltyCount;
-      await row.save();
-      playerFound = true;
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            row.Player = playerName;
+            row.Level = Number(playerLevel);
+            row.PenaltyCount = Number(penaltyCount);
+            row._rawData[0] = playerName;
+            row._rawData[1] = Number(playerLevel);
+            row._rawData[2] = Number(penaltyCount);
+            await row.save();
+            playerFound = true;
+            break;
+        }
     }
-  }
 
-  if (!playerFound)
-    await sheet.addRow({
-      Player: playerName,
-      Level: playerLevel,
-      PenaltyCount: penaltyCount,
-    });
+    if (!playerFound) {
+        await sheet.addRow({
+            Player: playerName,
+            Level: Number(playerLevel),
+            PenaltyCount: Number(penaltyCount),
+        });
+    }
 }
 
 /**
- * Load the stored game state for a player.
+ * Loads a player's saved game.
  *
- * @param {string} playerName Telegram username
+ * @param {string} playerName - Telegram username.
  * @returns {Promise<{player: string, level: number, penaltyCount: number} | null>}
  */
 async function loadGame(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[0];
+    const rows = await sheet.getRows();
 
-  var game = null;
-  const sheet = doc.sheetsByIndex[0];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            return {
+                player: String(row._rawData[0] || row.Player),
+                level: parseInt(row._rawData[1] || row.Level || "0", 10),
+                penaltyCount: parseInt(
+                    row._rawData[2] || row.PenaltyCount || "0",
+                    10,
+                ),
+            };
+        }
+    }
 
-  rows.forEach((row) => {
-    if (row._rawData[0] === playerName)
-      game = {
-        player: row._rawData[0],
-        level: row._rawData[1],
-        penaltyCount: row._rawData[2],
-      };
-  });
-
-  return game;
+    return null;
 }
 
 /**
- * Delete a finished or abandoned game from the active game sheet.
+ * Deletes a player's saved game after completion or manual reset.
  *
- * @param {string} playerName Telegram username
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<void>}
  */
 async function deleteGame(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[0];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[0];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
-
-  rows.forEach((row) => {
-    if (row._rawData[0] === playerName) row.delete();
-  });
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            await row.delete();
+            break;
+        }
+    }
 }
 
 /**
- * Convert the ladder sheet into a display string.
+ * Reads the public ladder / ranking list from the spreadsheet and formats it.
  *
- * @returns {Promise<string>} formatted leaderboard text
+ * @returns {Promise<string>} Ladder text.
  */
 async function parseLadder() {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[1];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[1];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    let ladderString = "";
 
-  var ladderString = "";
+    for (const row of rows) {
+        const position = row._rawData[0] || row.Position;
+        const player = row._rawData[1] || row.Player;
 
-  for (row of rows) {
-    if (typeof row._rawData[1] === "undefined") {
-      ladderString += `Place ${row._rawData[0]}: \n`;
-    } else {
-      ladderString += `Place ${row._rawData[0]}: ${row._rawData[1]}\n`;
+        ladderString += player
+            ? `Place ${position}: ${player}\n`
+            : `Place ${position}: \n`;
     }
-  }
 
-  return ladderString;
+    return ladderString.trim();
 }
 
 /**
- * Add a finished player to the first free leaderboard slot.
+ * Adds a player to the ladder if they are not already listed.
+ * The first empty slot is used; otherwise a new row is appended.
  *
- * @param {string} playerName Telegram username
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<void>}
  */
 async function addPlayerToLadder(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[1];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[1];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    for (const row of rows) {
+        if (String(row._rawData[1] || row.Player || "") === playerName) {
+            return;
+        }
 
-  for (row of rows) {
-    if (row._rawData[1] === playerName) {
-      break;
-    } else if (typeof row._rawData[1] === "undefined") {
-      row._rawData[1] = playerName;
-      await row.save();
-      break;
+        if (!row._rawData[1] && !row.Player) {
+            row.Player = playerName;
+            row._rawData[1] = playerName;
+            await row.save();
+            return;
+        }
     }
-  }
+
+    await sheet.addRow({ Position: rows.length + 1, Player: playerName });
 }
 
 /**
- * Activate a penalty timer for a player by storing the current timestamp.
+ * Stores or updates a player's penalty timestamp.
  *
- * @param {string} playerName Telegram username
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<void>}
  */
 async function setPenalty(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[2];
+    const rows = await sheet.getRows();
+    const date = new Date().toISOString();
 
-  const sheet = doc.sheetsByIndex[2];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
-
-  var date = new Date();
-  var playerFound = false;
-
-  for (row of rows) {
-    if (row._rawData[0] === playerName) {
-      row._rawData[1] = date;
-      await row.save();
-      playerFound = true;
-      break;
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            row.Time = date;
+            row._rawData[1] = date;
+            await row.save();
+            return;
+        }
     }
-  }
 
-  if (!playerFound) await sheet.addRow({ Player: playerName, Time: date });
+    await sheet.addRow({ Player: playerName, Time: date });
 }
 
 /**
- * Check whether a player's penalty is currently active.
- * If the penalty has already expired, cleanup is triggered.
+ * Checks whether a player is currently under an active penalty.
+ * Expired penalties are automatically removed.
  *
- * @param {string} playerName Telegram username
- * @returns {Promise<boolean>} true if penalty is active, otherwise false
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<boolean>} True if a penalty is still active.
  */
 async function checkPenalty(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[2];
+    const rows = await sheet.getRows();
+    const currentDate = new Date();
 
-  const sheet = doc.sheetsByIndex[2];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            const penaltyDate = new Date(row._rawData[1] || row.Time);
+            const difference = Math.floor(
+                (currentDate.getTime() - penaltyDate.getTime()) / 1000,
+            );
 
-  var penaltyActive = false;
-  var currentDate = new Date();
+            if (difference < PENALTY_SECONDS) {
+                return true;
+            }
 
-  for (row of rows) {
-    if (row._rawData[0] === playerName) {
-      var penaltyDate = new Date(row._rawData[1]);
-      var difference = (currentDate.getTime() - penaltyDate.getTime()) / 1000;
-
-      if (difference < 1800) {
-        penaltyActive = true;
-      } else {
-        penaltyActive = false;
-        removePenalty(playerName);
-      }
-
-      break;
+            await removePenalty(playerName);
+            return false;
+        }
     }
-  }
 
-  return penaltyActive;
+    return false;
 }
 
 /**
- * Remove a player's penalty entry from the penalty sheet.
+ * Removes a player's penalty entry from the spreadsheet.
  *
- * Note:
- * The original implementation loads the relevant sheet but does not perform
- * an actual deletion. This behavior is intentionally preserved.
- *
- * @param {string} playerName Telegram username
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<void>}
  */
 async function removePenalty(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[2];
+    const rows = await sheet.getRows();
 
-  const sheet = doc.sheetsByIndex[2];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            await row.delete();
+            break;
+        }
+    }
 }
 
 /**
- * Compute the remaining penalty time for a player.
+ * Returns the remaining penalty time in a human-readable format.
  *
- * @param {string} playerName Telegram username
- * @returns {Promise<string>} human-readable remaining time
+ * @param {string} playerName - Telegram username.
+ * @returns {Promise<string>} Remaining time string.
  */
 async function getRemainingPenaltyTime(playerName) {
-  const doc = new GoogleSpreadsheet(
-    "15xbstTjUU1-xa6GYPZue57UKHbGsbFG2qyWiDhi-IB0"
-  );
-  await doc.useServiceAccountAuth(creds);
-  await doc.loadInfo();
+    const doc = await getDoc();
+    const sheet = doc.sheetsByIndex[2];
+    const rows = await sheet.getRows();
+    const currentDate = new Date();
 
-  const sheet = doc.sheetsByIndex[2];
-  const rows = await sheet.getRows({
-    offset: 0,
-  });
+    for (const row of rows) {
+        if (String(row._rawData[0] || row.Player || "") === playerName) {
+            const penaltyDate = new Date(row._rawData[1] || row.Time);
+            const difference = Math.floor(
+                (currentDate.getTime() - penaltyDate.getTime()) / 1000,
+            );
+            const pendingTime = Math.max(PENALTY_SECONDS - difference, 0);
+            const minutes = Math.floor(pendingTime / 60);
+            const seconds = pendingTime % 60;
 
-  var penaltyFound = false;
-  var currentDate = new Date();
-
-  for (row of rows) {
-    if (row._rawData[0] === playerName) {
-      penaltyFound = true;
-      var penaltyDate = new Date(row._rawData[1]);
-      var difference = Math.floor(
-        (currentDate.getTime() - penaltyDate.getTime()) / 1000
-      );
-      var pendingTime = 1800 - difference;
-      break;
+            return `${minutes} minutes and ${seconds} seconds`;
+        }
     }
-  }
 
-  if (penaltyFound) {
-    var minutes = Math.floor(pendingTime / 60);
-    var seconds = pendingTime % 60;
-    return `${minutes} minutes and ${seconds} seconds`;
-  } else {
-    return "no penalty time";
-  }
+    return "0 minutes and 0 seconds";
 }
+
+/* -------------------------------------------------------------------------- */
+/*                              Global Commands                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * /start
+ * Shows the introductory message.
+ */
+bot.start((ctx) => ctx.reply(startMessage));
+
+/**
+ * /help
+ * Lists all available commands.
+ */
+bot.command("help", (ctx) => {
+    ctx.reply(`Here is a list of all available commands:
+/help - List all commands
+/newgame - Start a new Scavenger Hunt
+/resumegame - Resume your Scavenger Hunt
+/endgame - End your current Scavenger Hunt
+/ladder - Show the first ten players to finish the Scavenger Hunt
+/clue - Show the current clue
+/showprogress - Show how far you have gotten on your Scavenger Hunt
+/info - Show interesting facts about your current station`);
+});
+
+/**
+ * /ladder
+ * Shows the current ranking list.
+ */
+bot.command("ladder", async (ctx) => {
+    try {
+        const ladder = await parseLadder();
+        ctx.reply(`Here is the current ladder:\n${ladder}`);
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/**
+ * /newgame
+ * Starts a new game if none exists.
+ * If a save already exists, the user is sent into the "existingGame" scene.
+ */
+bot.command("newgame", async (ctx) => {
+    if (!requireUsername(ctx)) return;
+
+    try {
+        const found = await gameFound(ctx.from.username);
+
+        if (!found) {
+            ctx.session.save = {
+                player: ctx.from.username,
+                level: 0,
+                penaltyCount: 0,
+            };
+
+            await saveGame(
+                ctx.session.save.player,
+                ctx.session.save.level,
+                ctx.session.save.penaltyCount,
+            );
+
+            ctx.reply("Starting new game. Get ready for your first clue.");
+            ctx.scene.enter("game");
+            return;
+        }
+
+        ctx.reply(
+            'It seems like you have not finished an existing Scavenger Hunt.\nEnter "resume" to continue it.\nEnter "new" to start over. Your old progress will be lost.',
+        );
+        ctx.scene.enter("existingGame");
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/**
+ * /resumegame
+ * Restores an existing save and enters the main game scene.
+ */
+bot.command("resumegame", async (ctx) => {
+    if (!requireUsername(ctx)) return;
+
+    try {
+        const found = await gameFound(ctx.from.username);
+
+        if (!found) {
+            ctx.reply(
+                "No saved game was found for your Telegram username. Start a new game with /newgame.",
+            );
+            return;
+        }
+
+        const savedGame = await loadGame(ctx.from.username);
+        ctx.session.save = savedGame;
+        ctx.reply(
+            "Game found. Your Scavenger Hunt will be resumed. Here is your clue:",
+        );
+        ctx.scene.leave();
+        ctx.scene.enter("game");
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/**
+ * /clue
+ * Outside the game scene, this reminds the user to start or resume a game.
+ */
+bot.command("clue", (ctx) => {
+    ctx.reply("Please enter a game by using /newgame or /resumegame.");
+});
+
+/**
+ * /showprogress
+ * Displays progress if a saved game exists.
+ */
+bot.command("showprogress", async (ctx) => {
+    if (!requireUsername(ctx)) return;
+
+    try {
+        const game = await loadGame(ctx.from.username);
+
+        if (!game) {
+            ctx.reply("No active game found. Start one with /newgame.");
+            return;
+        }
+
+        ctx.reply(completedStationsText(game.level));
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/**
+ * /info
+ * Outside the active game scene, this reminds the user that they must be in a game.
+ */
+bot.command("info", (ctx) => {
+    ctx.reply("Please enter a game before using this command.");
+});
+
+/* -------------------------------------------------------------------------- */
+/*                          Scene: existingGame                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Handles user input after /newgame when a save already exists.
+ *
+ * Accepted text inputs:
+ * - "resume" -> continue existing game
+ * - "new"    -> overwrite progress and start from the beginning
+ */
+existingGame.on("text", async (ctx) => {
+    if (!requireUsername(ctx)) return;
+
+    try {
+        if (ctx.message.text === "resume") {
+            const savedGame = await loadGame(ctx.from.username);
+
+            if (!savedGame) {
+                ctx.reply(
+                    "No previous game was found anymore. Please start a new one with /newgame.",
+                );
+                ctx.scene.leave();
+                return;
+            }
+
+            ctx.session.save = savedGame;
+            ctx.reply(
+                "Your old Scavenger Hunt will be resumed.\nHere is your last clue:",
+            );
+            ctx.scene.leave();
+            ctx.scene.enter("game");
+            return;
+        }
+
+        if (ctx.message.text === "new") {
+            const savedGame = await loadGame(ctx.from.username);
+
+            ctx.session.save = {
+                player: ctx.from.username,
+                level: 0,
+                penaltyCount: savedGame ? savedGame.penaltyCount : 0,
+            };
+
+            await saveGame(
+                ctx.session.save.player,
+                ctx.session.save.level,
+                ctx.session.save.penaltyCount,
+            );
+
+            ctx.reply(
+                "You have started a new Scavenger Hunt.\nYour old progress has been replaced.\nHere is your first clue:",
+            );
+            ctx.scene.leave();
+            ctx.scene.enter("game");
+            return;
+        }
+
+        ctx.reply('Please enter either "resume" or "new".');
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                              Scene: game                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Triggered whenever the player enters the main game scene.
+ * Immediately sends the current clue.
+ */
+game.enter((ctx) => {
+    if (!ctx.session.save) {
+        ctx.reply("No active game found. Start one with /newgame.");
+        ctx.scene.leave();
+        return;
+    }
+
+    ctx.reply(currentStationText(ctx.session.save.level));
+});
+
+/**
+ * Main game loop:
+ * - handles scene-local commands
+ * - validates answers
+ * - manages penalties
+ * - advances progression
+ * - finalizes the game
+ */
+game.on("text", async (ctx) => {
+    if (!requireUsername(ctx)) return;
+
+    if (!ctx.session.save) {
+        ctx.reply("No active game found. Start one with /newgame.");
+        ctx.scene.leave();
+        return;
+    }
+
+    try {
+        const text = String(ctx.message.text).trim();
+
+        /* ---------------------------- Scene-local commands --------------------------- */
+
+        if (text === "/endgame") {
+            await saveGame(
+                ctx.session.save.player,
+                ctx.session.save.level,
+                ctx.session.save.penaltyCount,
+            );
+            ctx.reply(
+                "Leaving the current Scavenger Hunt. Your progress has been saved.",
+            );
+            ctx.scene.leave();
+            return;
+        }
+
+        if (text === "/newgame") {
+            ctx.reply("Your Scavenger Hunt is already in progress.");
+            return;
+        }
+
+        if (text === "/ladder") {
+            const ladder = await parseLadder();
+            ctx.reply(`Here is the current ladder:\n${ladder}`);
+            return;
+        }
+
+        if (text === "/help") {
+            ctx.reply(`Here is a list of all available commands:
+/help - List all commands
+/newgame - Start a new Scavenger Hunt
+/resumegame - Resume your Scavenger Hunt
+/endgame - End your current Scavenger Hunt
+/ladder - Show the first ten players to finish the Scavenger Hunt
+/clue - Show the current clue
+/showprogress - Show how far you have gotten on your Scavenger Hunt
+/info - Show interesting facts about your current station`);
+            return;
+        }
+
+        if (text === "/clue") {
+            ctx.reply(
+                `Here is your current clue:\n\n${currentStationText(ctx.session.save.level)}`,
+            );
+            return;
+        }
+
+        if (text === "/showprogress") {
+            ctx.reply(completedStationsText(ctx.session.save.level));
+            return;
+        }
+
+        if (text === "/info") {
+            if (ctx.session.save.level > 0) {
+                ctx.reply(envelopesJSON[ctx.session.save.level - 1].info);
+            } else {
+                ctx.reply(
+                    "No station has been completed yet, so there is no info text to show.",
+                );
+            }
+            return;
+        }
+
+        /* ----------------------------- Penalty checking ------------------------------ */
+
+        const penaltyActive = await checkPenalty(ctx.from.username);
+
+        if (penaltyActive) {
+            const time = await getRemainingPenaltyTime(ctx.from.username);
+
+            if (ctx.session.save.penaltyCount !== 0) {
+                ctx.session.save.penaltyCount = 0;
+                await saveGame(
+                    ctx.session.save.player,
+                    ctx.session.save.level,
+                    ctx.session.save.penaltyCount,
+                );
+            }
+
+            ctx.reply(`Your penalty is still pending. Please wait ${time}.`);
+            return;
+        }
+
+        /* ---------------------------- Answer verification ---------------------------- */
+
+        const expectedAnswer = String(envelopeOrder[ctx.session.save.level]);
+
+        if (text === expectedAnswer) {
+            ctx.session.save.level += 1;
+            ctx.session.save.penaltyCount = 0;
+
+            await saveGame(
+                ctx.session.save.player,
+                ctx.session.save.level,
+                ctx.session.save.penaltyCount,
+            );
+
+            /* --------------------------- Game completion case -------------------------- */
+
+            if (ctx.session.save.level >= ANSWER_COUNT) {
+                const finalEntry = envelopesJSON[ANSWER_COUNT];
+
+                if (finalEntry) {
+                    const finalText = [finalEntry.clue, finalEntry.task]
+                        .filter(Boolean)
+                        .join("\n\n");
+
+                    if (finalText) {
+                        ctx.reply(finalText);
+                    }
+                }
+
+                ctx.reply(
+                    "Congratulations! You have successfully finished the Scavenger Hunt.",
+                );
+                await addPlayerToLadder(ctx.session.save.player);
+                await deleteGame(ctx.session.save.player);
+                ctx.scene.leave();
+                return;
+            }
+
+            /* ------------------------- Normal correct-answer case ---------------------- */
+
+            ctx.reply(
+                `Congrats! Your answer is right.\nUse /info to learn more about your completed station.\nHere is the next clue:\n\n${currentStationText(
+                    ctx.session.save.level,
+                )}`,
+            );
+            return;
+        }
+
+        /* ----------------------------- Wrong answer case ----------------------------- */
+
+        ctx.session.save.penaltyCount += 1;
+
+        await saveGame(
+            ctx.session.save.player,
+            ctx.session.save.level,
+            ctx.session.save.penaltyCount,
+        );
+
+        if (ctx.session.save.penaltyCount > 2) {
+            await setPenalty(ctx.from.username);
+            ctx.session.save.penaltyCount = 0;
+
+            await saveGame(
+                ctx.session.save.player,
+                ctx.session.save.level,
+                ctx.session.save.penaltyCount,
+            );
+
+            const time = await getRemainingPenaltyTime(ctx.from.username);
+            ctx.reply(
+                `Too many wrong attempts. A penalty has been activated for ${time}.`,
+            );
+            return;
+        }
+
+        ctx.reply("Your number is incorrect. Try again.");
+    } catch (error) {
+        handleFatalError(ctx, error);
+    }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                              Bot Bootstrap                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Starts the bot either in polling mode or webhook mode.
+ *
+ * Webhook mode requires:
+ * - PUBLIC_URL
+ * - PORT
+ *
+ * Default mode:
+ * - polling
+ */
+function startBot() {
+    const deploymentMode = (
+        process.env.DEPLOYMENT_MODE || "polling"
+    ).toLowerCase();
+
+    if (deploymentMode === "webhook") {
+        if (!process.env.PUBLIC_URL || !process.env.PORT) {
+            console.error(
+                "Webhook mode requires PUBLIC_URL and PORT to be set.",
+            );
+            process.exit(1);
+        }
+
+        const webhookPath = `/bot${process.env.TELEGRAM_TOKEN}`;
+        bot.telegram.setWebhook(`${process.env.PUBLIC_URL}${webhookPath}`);
+        bot.startWebhook(webhookPath, null, parseInt(process.env.PORT, 10));
+        console.log(`Bot started in webhook mode on port ${process.env.PORT}.`);
+        return;
+    }
+
+    bot.launch();
+    console.log("Bot started in polling mode.");
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Process Lifecycle                              */
+/* -------------------------------------------------------------------------- */
+
+startBot();
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));

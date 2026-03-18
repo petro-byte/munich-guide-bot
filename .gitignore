@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+package-lock.json
 
 # Logs
 logs/
@@ -59,3 +60,7 @@ Thumbs.db
 
 # Local history
 .history/
+
+# Other
+repo_context_exporter.py
+llm-context/

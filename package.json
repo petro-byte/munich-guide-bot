@@ -1,12 +1,11 @@
 {
   "name": "munich-guide-bot",
-  "version": "1.0.0",
-  "description": "Archived Telegram scavenger-hunt bot for guided inner-city tours in Munich.",
+  "version": "1.1.0",
+  "description": "Interactive Telegram scavenger-hunt bot guiding users through Munich's city center.",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js",
-    "test": "echo \"No automated tests configured for this archived project.\""
+    "dev": "nodemon bot.js"
   },
   "keywords": [
     "telegram-bot",
@@ -15,8 +14,9 @@
     "city-guide",
     "telegraf",
     "nodejs",
+    "google-sheets",
     "portfolio-project",
-    "archived-project"
+    "interactive-bot"
   ],
   "author": "Luka Petrovic",
   "license": "ISC",
