@@ -2,7 +2,7 @@
 
 Interactive Telegram scavenger-hunt bot guiding users through Munich’s historical city center.
 
-**Telegram Bot:**  t.me/munichguidebot
+**Telegram Bot:**  [t.me/munichguidebot](https://t.me/munichguidebot)
 
 ## Project Background
 
